@@ -1,0 +1,69 @@
+# Llama Stack CR Configuration for s390x
+version: '2'
+image_name: starter
+
+#inference API
+apis:
+  - inference
+
+# Provider configuration
+providers:
+  inference:
+    - provider_id: vllm
+      provider_type: remote::vllm
+      config:
+        url: ${VLLM_URL:http://localhost:8000}
+
+# Model configuration
+models:
+  - model_id: ${INFERENCE_MODEL:TinyLlama/TinyLlama-1.1B-Chat-v1.0}
+    provider_id: vllm
+    model_type: llm
+
+# Server configuration
+server:
+  port: ${PORT:8321}
+
+# Storage configuration - PostgreSQL
+storage:
+  backends:
+    kv_default:
+      type: kv_postgres
+      host: ${POSTGRES_HOST:localhost}
+      port: ${POSTGRES_PORT:5432}
+      db: ${POSTGRES_DB:llamastack}
+      user: ${POSTGRES_USER:llamastack}
+      password: ${POSTGRES_PASSWORD:llamastack}
+      table_name: llamastack_kvstore
+    sql_default:
+      type: sql_postgres
+      host: ${POSTGRES_HOST:localhost}
+      port: ${POSTGRES_PORT:5432}
+      db: ${POSTGRES_DB:llamastack}
+      user: ${POSTGRES_USER:llamastack}
+      password: ${POSTGRES_PASSWORD:llamastack}
+  stores:
+    metadata:
+      backend: kv_default
+      namespace: registry
+    inference:
+      backend: sql_default
+      table_name: inference_store
+      max_write_queue_size: 10000
+      num_writers: 4
+    conversations:
+      backend: sql_default
+      table_name: openai_conversations
+    prompts:
+      backend: kv_default
+      namespace: prompts
+
+# Registered resources (empty for inference-only)
+registered_resources:
+  shields: []
+  vector_stores: []
+  datasets: []
+  scoring_fns: []
+  benchmarks: []
+  tool_groups: []
+
