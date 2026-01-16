@@ -276,7 +276,7 @@ RUN uv pip install --no-cache --no-deps git+https://github.com/opendatahub-io/ll
 RUN mkdir -p ${HOME}/.llama ${HOME}/.cache
 RUN mkdir -p ${HOME}/.llama/distributions/vllm && \
     chmod -R 775 ${HOME}/.llama
-COPY distribution/run.yaml ${APP_ROOT}/run.yaml
+COPY distribution/config-s390x.yaml ${APP_ROOT}/config.yaml
 COPY --chmod=755 distribution/entrypoint.sh ${APP_ROOT}/entrypoint.sh
 
 #TODO: remove this once we have a stable version of llama-stack
