@@ -1,0 +1,287 @@
+
+FROM registry.access.redhat.com/ubi9/python-312@sha256:95ec8d3ee9f875da011639213fd254256c29bc58861ac0b11f290a291fa04435
+
+ARG TARGETARCH=s390x
+
+WORKDIR /opt/app-root
+
+# Switch to root for system package installation
+USER root
+
+RUN pip install uv
+RUN pip install sqlalchemy 
+
+# Build pyarrow ONLY on s390x
+RUN /bin/bash <<'EOF'
+set -Eeuxo pipefail
+
+# fail if not s390x
+if [ "${TARGETARCH}" != "s390x" ]; then
+  echo "ERROR: pyarrow build block is intended for s390x only"
+  exit 1
+fi
+
+# Install build dependencies (including Rust for tiktoken, SWIG and BLAS for faiss-cpu)
+dnf install -y \
+    cmake \
+    make \
+    gcc-c++ \
+    wget \
+    patch \
+    libcurl-devel \
+    openssl-devel \
+    git \
+    rust \
+    cargo \
+    python3-devel \
+    pcre2-devel \
+    autoconf \
+    automake \
+    bison \
+    openblas-devel
+
+dnf clean all
+
+# Build SWIG from source (required for faiss-cpu Python bindings)
+cd /tmp
+wget https://downloads.sourceforge.net/project/swig/swig/swig-4.2.1/swig-4.2.1.tar.gz
+tar -xzf swig-4.2.1.tar.gz
+cd swig-4.2.1
+./configure --prefix=/usr/local
+make -j$(nproc)
+make install
+cd /tmp
+rm -rf swig-4.2.1 swig-4.2.1.tar.gz
+
+# Verify SWIG installation
+/usr/local/bin/swig -version
+
+# Build FAISS C++ library AND Python bindings from source
+cd /tmp
+git clone --depth 1 --branch v1.12.0 https://github.com/facebookresearch/faiss.git
+cd faiss
+
+# Install numpy
+pip install numpy
+
+# Get Python and NumPy paths
+PYTHON_VERSION=$(python3.12 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+NUMPY_INCLUDE=$(python3.12 -c "import numpy; print(numpy.get_include())")
+PYTHON_INCLUDE=$(python3.12 -c "import sysconfig; print(sysconfig.get_path('include'))")
+PYTHON_LIB=$(python3.12 -c "import sysconfig; print(sysconfig.get_config_var('LIBDIR'))")
+
+echo "Python version: $PYTHON_VERSION"
+echo "Python include: $PYTHON_INCLUDE"
+echo "Python library dir: $PYTHON_LIB"
+echo "NumPy include: $NUMPY_INCLUDE"
+
+# Build FAISS C++ with Python bindings enabled
+cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DFAISS_ENABLE_GPU=OFF \
+    -DFAISS_ENABLE_PYTHON=ON \
+    -DBUILD_TESTING=OFF \
+    -DBUILD_SHARED_LIBS=ON \
+    -DFAISS_OPT_LEVEL=generic \
+    -DPython_EXECUTABLE=/usr/bin/python3.12 \
+    -DPython_INCLUDE_DIR="$PYTHON_INCLUDE" \
+    -DPython_LIBRARY="$PYTHON_LIB/libpython${PYTHON_VERSION}.so" \
+    -DPython_NumPy_INCLUDE_DIR="$NUMPY_INCLUDE"
+
+cmake --build build --config Release -j$(nproc)
+cmake --install build
+
+# Install FAISS Python bindings
+cd build/faiss/python
+pip install .
+
+# Copy libfaiss_python_callbacks.so to system library path so _swigfaiss.so can find it
+# This library is built as part of FAISS Python bindings and needs to be in a standard location
+FAISS_PYTHON_PKG=$(python3.12 -c "import site; print([p for p in site.getsitepackages() if 'lib64' in p][0])")/faiss
+if [ -f "$FAISS_PYTHON_PKG/libfaiss_python_callbacks.so" ]; then
+    echo "Copying libfaiss_python_callbacks.so to /usr/local/lib64"
+    cp "$FAISS_PYTHON_PKG/libfaiss_python_callbacks.so" /usr/local/lib64/
+fi
+
+# Ensure libraries are in the dynamic linker path
+echo "/usr/local/lib" >> /etc/ld.so.conf.d/usr-local.conf
+echo "/usr/local/lib64" >> /etc/ld.so.conf.d/usr-local.conf
+ldconfig
+
+cd /tmp
+rm -rf faiss
+
+# Clone Arrow source
+cd /tmp
+git clone --depth 1 --branch apache-arrow-21.0.0 https://github.com/apache/arrow.git
+cd arrow
+rm -rf .git
+
+# Build Arrow C++
+cd cpp
+mkdir release && cd release
+
+cmake -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX=/usr/local \
+      -DARROW_PYTHON=ON \
+      -DARROW_PARQUET=ON \
+      -DARROW_ORC=ON \
+      -DARROW_FILESYSTEM=ON \
+      -DARROW_JSON=ON \
+      -DARROW_CSV=ON \
+      -DARROW_DATASET=ON \
+      -DARROW_DEPENDENCY_SOURCE=BUNDLED \
+      -DARROW_WITH_LZ4=OFF \
+      -DARROW_WITH_ZSTD=OFF \
+      -DARROW_WITH_SNAPPY=OFF \
+      -DARROW_SUBSTRAIT=ON \
+      -DARROW_BUILD_TESTS=OFF \
+      -DARROW_BUILD_BENCHMARKS=OFF \
+      ..
+
+make -j$(nproc)
+make install
+
+# Build Python wheel
+cd ../../python
+
+pip install --no-cache-dir \
+    --extra-index-url https://pypi.org/simple \
+    -r requirements-build.txt
+
+PYARROW_WITH_PARQUET=1 \
+PYARROW_WITH_DATASET=1 \
+PYARROW_WITH_FILESYSTEM=1 \
+PYARROW_WITH_JSON=1 \
+PYARROW_WITH_CSV=1 \
+PYARROW_PARALLEL=$(nproc) \
+python setup.py build_ext \
+    --build-type=release \
+    --bundle-arrow-cpp \
+    bdist_wheel
+
+# Install the built wheel
+pip install dist/pyarrow-*.whl
+
+# Cleanup
+cd /
+rm -rf /tmp/arrow
+
+EOF
+
+# Build GEOS library from source (required for shapely, which is needed by google-cloud-aiplatform)
+# Reference: https://github.com/ppc64le/build-scripts/blob/master/g/geos/geos_ubi_8.5.sh
+RUN /bin/bash <<'EOF'
+set -Eeuxo pipefail
+
+cd /tmp
+git clone --depth 1 --branch 3.11.1 https://github.com/libgeos/geos.git
+cd geos
+mkdir build
+cd build
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local ..
+make -j$(nproc)
+make install
+
+# Ensure libraries are in the dynamic linker path 
+touch /etc/ld.so.conf.d/usr-local.conf
+grep -q "/usr/local/lib" /etc/ld.so.conf.d/usr-local.conf || echo "/usr/local/lib" >> /etc/ld.so.conf.d/usr-local.conf
+grep -q "/usr/local/lib64" /etc/ld.so.conf.d/usr-local.conf || echo "/usr/local/lib64" >> /etc/ld.so.conf.d/usr-local.conf
+ldconfig
+
+cd /tmp
+rm -rf geos
+EOF
+
+# Switch back to default user for Python package installations
+USER 1001
+
+# Set environment variables for FAISS C++ library location
+# Include both lib and lib64 paths for compatibility
+ENV FAISS_INCLUDE_DIR=/usr/local/include \
+    FAISS_LIB_DIR=/usr/local/lib64 \
+    LD_LIBRARY_PATH=/usr/local/lib64:/usr/local/lib:${LD_LIBRARY_PATH} \
+    PKG_CONFIG_PATH=/usr/local/lib64/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH}
+
+#install packages that depend on pyarrow
+RUN uv pip install --upgrade \
+    'kfp-kubernetes==2.14.6' \
+    'botocore==1.35.88' \
+    'boto3==1.35.88' \
+    'aiobotocore==2.16.1' \
+    'ibm-cos-sdk-core==2.14.2' \
+    'ibm-cos-sdk==2.14.2'
+
+# Install numpy 
+RUN uv pip install numpy
+
+# Set environment variable for grpcio build on s390x
+ENV GRPC_PYTHON_BUILD_SYSTEM_OPENSSL=1
+
+RUN uv pip install \
+    'datasets>=4.0.0' \
+    'mcp>=1.23.0' \
+    'pymilvus>=2.4.10' \
+    aiosqlite \
+    asyncpg \
+    autoevals \
+    boto3 \
+    chardet \
+    einops \
+    fastapi \
+    fire \
+    google-cloud-aiplatform \
+    httpx \
+    litellm \
+    matplotlib \
+    nltk \
+    opentelemetry-exporter-otlp-proto-http \
+    opentelemetry-sdk \
+    pandas \
+    pillow \
+    psycopg2-binary \
+    pymongo \
+    pypdf \
+    redis \
+    requests \
+    safetensors \
+    scikit-learn \
+    scipy \
+    sentencepiece \
+    sqlalchemy[asyncio] \
+    tokenizers \
+    tqdm \
+    transformers \
+    uvicorn
+
+RUN uv pip install \
+    llama_stack_provider_lmeval==0.4.1
+
+RUN uv pip install \
+    llama_stack_provider_ragas==0.5.1
+
+RUN uv pip install \
+    llama_stack_provider_ragas[remote]==0.5.1
+
+RUN uv pip install \
+    llama_stack_provider_trustyai_fms==0.3.2
+
+RUN uv pip install --extra-index-url https://download.pytorch.org/whl/cpu 'torchao>=0.12.0' torch torchvision
+
+RUN uv pip install --no-deps sentence-transformers
+
+RUN uv pip install --no-cache --no-deps git+https://github.com/opendatahub-io/llama-stack.git@v0.3.5+rhai0
+
+RUN mkdir -p ${HOME}/.llama ${HOME}/.cache
+RUN mkdir -p ${HOME}/.llama/distributions/vllm && \
+    chmod -R 775 ${HOME}/.llama
+COPY distribution/run.yaml ${APP_ROOT}/run.yaml
+COPY --chmod=755 distribution/entrypoint.sh ${APP_ROOT}/entrypoint.sh
+
+#TODO: remove this once we have a stable version of llama-stack
+# LLS server version is not aligned with the client version, so we disable the version check
+# Currently, LLS client version is 0.3.0, while the server version is 0.3.0rc3+rhai0
+ENV LLAMA_STACK_DISABLE_VERSION_CHECK=true
+ENV PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python
+ENTRYPOINT [ "/opt/app-root/entrypoint.sh" ]
